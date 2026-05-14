@@ -105,26 +105,39 @@ def pdf_to_text(pdf_path: str) -> str:
 # 2. ВСПОМОГАТЕЛЬНЫЙ ВЫЗОВ LLM
 # ════════════════════════════════════════════════════════════════
 
-def call_llm(api_key: str, system_prompt: str, user_prompt: str, max_tokens: int = 4000) -> str:
-    """Единая точка вызова LLM через OpenRouter. max_tokens: extraction=3000, comparison=8000."""
+def call_llm(api_key: str, system_prompt: str, user_prompt: str, max_tokens: int = 4000,
+             _retry: int = 0) -> str:
+    """
+    Единая точка вызова LLM через OpenRouter.
+    max_tokens: extraction=3000, comparison=8000.
+    При сетевой ошибке или невалидном ответе — до 3 повторных попыток.
+    """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": OPENROUTER_REFERER,
-        "X-Title": "TZ Drawing Analyzer",
+        "X-Title": "TZ Drawing Analyzer v2",
     }
     payload = {
         "model": MODEL,
         "max_tokens": max_tokens,
-        "temperature": 0.1,
+        "temperature": 0,  # детерминированный режим — убирает случайные галлюцинации
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     }
-    resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=300)
-    resp.raise_for_status()
-    text = resp.json()["choices"][0]["message"]["content"].strip()
+    try:
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=300)
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+    except (requests.exceptions.RequestException, KeyError) as e:
+        if _retry < 3:
+            import time
+            time.sleep(2 ** _retry)  # экспоненциальная задержка: 1, 2, 4 сек
+            return call_llm(api_key, system_prompt, user_prompt, max_tokens, _retry + 1)
+        raise RuntimeError(f"API недоступен после 3 попыток: {e}") from e
+
     # Убираем markdown-обёртки если модель добавила
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text[3:]
@@ -193,16 +206,36 @@ def repair_json(text: str) -> str:
     return text
 
 
-def parse_json_response(text: str, context: str = "") -> dict:
-    """Парсит JSON из ответа LLM, пытаясь починить обрезанный ответ."""
+def parse_json_response(text: str, context: str = "",
+                        api_key: str = "", system: str = "", user: str = "",
+                        max_tokens: int = 4000) -> dict:
+    """
+    Парсит JSON из ответа LLM.
+    Если не удалось — пробует починить через repair_json.
+    Если всё равно не удалось и переданы параметры запроса — повторяет вызов API
+    с явной инструкцией вернуть валидный JSON.
+    """
     repaired = repair_json(text)
     try:
         return json.loads(repaired)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"JSON parse error ({context}): {e}\n\n"
-            f"Ответ модели (первые 1500 символов):\n{text[:1500]}"
-        ) from e
+    except json.JSONDecodeError:
+        pass
+
+    # Если есть параметры запроса — повторяем с усиленной инструкцией
+    if api_key and user:
+        retry_system = system + "\n\nКРИТИЧНО: верни ТОЛЬКО валидный JSON. Никакого текста до или после. Никаких пояснений."
+        retry_user = user + "\n\nПОВТОРНЫЙ ЗАПРОС: предыдущий ответ содержал невалидный JSON. Верни только JSON, ничего более."
+        try:
+            retry_text = call_llm(api_key, retry_system, retry_user, max_tokens)
+            retry_repaired = repair_json(retry_text)
+            return json.loads(retry_repaired)
+        except (json.JSONDecodeError, RuntimeError):
+            pass
+
+    raise RuntimeError(
+        f"JSON parse error ({context}) — не удалось исправить даже после повтора.\n"
+        f"Ответ модели (первые 1500 символов):\n{text[:1500]}"
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -267,7 +300,7 @@ def extract_parameters(api_key: str, source_name: str, text: str, source_type: s
 {text}"""
 
     response_text = call_llm(api_key, system, user, max_tokens=3000)
-    return parse_json_response(response_text, context=f"extraction:{source_name}")
+    return parse_json_response(response_text, context=f"extraction:{source_name}", api_key=api_key, system=system, user=user, max_tokens=3000)
 
 
 
@@ -325,7 +358,9 @@ def verify_extracted(api_key: str, drawings_data: dict, tz_data: dict) -> dict:
 ПРАВИЛО: если после удаления фантомов остаётся одно значение — верни его как строку.
 Если остаётся несколько реально разных значений из разных файлов — верни через "; ".
 Если значение корректно — оставь без изменений.
-Если нет уверенности — оставь исходное значение, не трогай.
+Если нет уверенности — ОБЯЗАТЕЛЬНО оставь исходное значение без изменений.
+ПРАВИЛО КОНСЕРВАТИЗМА: лучше оставить лишнее значение, чем удалить нужное.
+Удаляй только когда АБСОЛЮТНО очевидно что значение из чужого контекста.
 
 Верни JSON той же структуры что получил в "ДАННЫЕ ИЗ ЧЕРТЕЖЕЙ", только с исправленными value:
 {{
@@ -341,7 +376,7 @@ def verify_extracted(api_key: str, drawings_data: dict, tz_data: dict) -> dict:
 }}"""
 
     response_text = call_llm(api_key, system, user, max_tokens=4000)
-    verified = parse_json_response(response_text, context="verify_extracted")
+    verified = parse_json_response(response_text, context="verify_extracted", api_key=api_key, system=system, user=user, max_tokens=4000)
 
     # Если верификация вернула неполный результат — используем оригинал
     for file_name in drawings_data:
@@ -496,7 +531,7 @@ def compare_parameters(
 - НЕЗНАЧИТЕЛЬНО: уточняющие характеристики, косметические различия, формат записи"""
 
     response_text = call_llm(api_key, system, user, max_tokens=8000)
-    result = parse_json_response(response_text, context="comparison")
+    result = parse_json_response(response_text, context="comparison", api_key=api_key, system=system, user=user, max_tokens=8000)
 
     # Пересчитываем счётчики (не доверяем модели)
     result["summary"]["total_matches"] = len(result.get("matches", []))
